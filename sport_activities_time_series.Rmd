@@ -1,0 +1,408 @@
+---
+title: "Time Series Assignment"
+author: "Anna Nagy-Staron"
+date: "28/1/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r packages, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(cowplot)
+library(GGally)
+library(tsibble)
+library(tseries)
+library(xts)
+library(tidyverse)
+library(timetk)
+library(autoTS)
+```
+
+#### 1. Assignment
+The aim of this assignment is to analyse four time series of chosen sport activities' metrics and attempt to predict their values for the next 12 months.  
+
+#### 2. Data preparation
+
+```{r data import and first cleaning, include=FALSE}
+
+dat <- read.csv("Activities_2022.csv", header = T)
+
+dat <- dat %>% 
+  mutate(start_time=as_datetime(startTimeLocal/1000), # create a timestamp
+         date = floor_date(start_time,"day"), # round to the day
+         is_bike=ifelse(activityType %in% c("cycling","virtual_ride","indoor_cycling","road_biking","cyclocross"),T,F), # is it bike or not ? does activityType belong to any of the listed sports?
+         is_run = str_detect(activityType,"running|hiking"),
+         # move activities into four categories
+         activity_recoded = case_when(is_bike ~ "Bike",
+                                      is_run ~ "Run",
+                                      str_detect(activityType,"swim") ~"Swim",
+                                      TRUE ~ "Other")) %>% 
+  mutate(across(c(contains("Id"),contains("uuid")),
+                as.character)) %>% 
+  # discretize distance
+  mutate(qual_distance=as.character(cut(distance,
+                                        quantile(distance,probs = 0:5/5,na.rm=T),
+                                        include.lowest = T,
+                                        labels=c("Very short","Short",
+                                                 "Average","Long","Very long"))),
+         qual_avgHr=as.character(cut(avgHr,quantile(avgHr,0:3/5,na.rm = T),
+                                     include.lowest = T,
+                                     labels=c("Low intensity","Average intensity",
+                                              "High intensity"))),
+         qual_distance=ifelse(is.na(qual_distance),"Very short",qual_distance),
+         distance=distance/1E5, # convert to km
+         calories = calories/4.184) %>% # convert from joules in calories
+  mutate(across(contains("elevation"),function(xx) xx/1E2))  %>%  # convert too meters
+  mutate(across(contains("Speed"),function(xx) xx*36))  %>% # convert to km/h
+  mutate(across(c(duration,contains("Duration")),
+                function(xx) time_length(xx/1000,"minutes")))
+
+
+dat_clean <- filter(dat,!(activityId %in% c(407226313,2321338)) & year(date)>=2012)
+```
+
+##### 2.1. Analysis of interesting metrics
+
+In order to pick the most relevant metrics, I have first looked at metrics which have the smallest number of missing values. 
+
+```{r find missing values for variables, include=FALSE}
+
+na_count <- sapply(dat_clean, function(x) sum(length(which(is.na(x)))))
+df_na_count <- data.frame(na_count) %>%
+arrange(., na_count) 
+```
+```{r show variables with no or few missing values, echo = FALSE}
+head(arrange(df_na_count), 25)
+
+```
+
+Based on the above results, I decided to first pick duration (0 missing values), distance (7), avgerage speed (43), and calories (53) and take a closer look at them. For these four metrics I checked whether there are any obvious outliers.
+
+```{r distribution as a function of activityType, include=FALSE}
+
+x1 = ggplot(dat_clean, aes(activityType, duration)) + geom_point() + coord_flip() + labs(y = "Duration (min)") + theme(axis.title.y = element_blank())
+x2 = ggplot(dat_clean, aes(activityType, distance)) + geom_point() + coord_flip() + labs(y = "Distance (km)") + theme(axis.title.y = element_blank())
+x3 = ggplot(dat_clean, aes(activityType, avgSpeed)) + geom_point() + coord_flip() + labs(y = "Average speed (km/h)") + theme(axis.title.y = element_blank())
+x4 = ggplot(dat_clean, aes(activityType, calories)) + geom_point() + coord_flip() + labs(y = "Calories (cal)") + theme(axis.title.y = element_blank())
+```
+```{r plot distribution as a function of activityType, echo = FALSE, warning=FALSE}
+plot_grid(x1, x2, x3, x4, align='vh')
+```
+
+There seem to be no obvious outliers for any of the metrics, even though data with multisport as activity type is quite ambitious.
+For the time series analysis, I chose average cycling speed, distance, duration, as well as number of bike rides.
+
+##### 2.2. Aggregate data
+In order to create a monthly series for each metric, I aggregated the data in a following way:
+
+- monthly count of bike rides,
+- monthly sum of distances,
+- monthly sum of activity duration,
+- monthly average of average biking speed.
+
+```{r modify dataset, include=FALSE}
+dat_clean$train_month <- floor_date(dat_clean$date, "month") #add month variable for aggregation
+dat_clean$train_month <- as.Date(dat_clean$train_month, format =  "%Y/%m/%d")
+```
+```{r aggregate bike data, include=FALSE}
+dat_bike <- filter(dat_clean,is_bike) # subset of only bike data
+
+agg_is_bike <- dat_bike %>%
+  group_by(train_month) %>%
+  summarize(sum_bikes = sum(is_bike))
+x_bike = ggplot(agg_is_bike, aes(x=train_month, y=sum_bikes)) +
+  geom_line(color="orange") + labs(y = "Bike rides/month") + theme(axis.title.x = element_blank())
+```
+```{r aggregate duration data, include=FALSE}
+agg_duration <- dat_clean %>%
+  group_by(train_month) %>%
+  summarize(sum_duration = sum(duration))
+
+x_duration = ggplot(agg_duration, aes(x=train_month, y=sum_duration)) +
+  geom_line(color="orange") + labs(y = "Excercise duration/month (min)") + theme(axis.title.x = element_blank())
+```
+```{r aggregate distance data, include=FALSE}
+agg_distance <- dat_clean %>%
+  group_by(train_month) %>%
+  summarize(sum_distance = sum(distance, na.rm = T))
+
+x_distance = ggplot(agg_distance, aes(x=train_month, y=sum_distance)) +
+  geom_line(color="orange") + labs(y = "Distance/month (km)") + theme(axis.title.x = element_blank())
+```
+```{r aggregate speed data, include=FALSE}
+agg_speed <- dat_bike %>%
+  group_by(train_month) %>%
+  summarize(mean_speed = mean(avgSpeed, na.rm = T))
+
+x_speed = ggplot(agg_speed, aes(x=train_month, y=mean_speed)) +
+  geom_line(color="orange") + labs(y = "Average biking speed (km/h)") + theme(axis.title.x = element_blank())
+```
+```{r plot time series for all four variables, echo=FALSE}
+plot_grid(x_bike, x_duration, x_distance, x_speed, align='vh')
+```
+
+#### 3. Time series analysis
+
+For each of the four metrics, I first looked whether it is stationary or not, and if there is a trend and/or a seasonal pattern. Then I attempted to predict values of this metric for the next 12 months, choosing between different models the one that performs best when predicting the last 12 months of the available data.
+
+##### 3.1. Count of bike rides
+
+This time series shows monthly count of bike rides in the last 10 years.
+```{r create time series, include=FALSE}
+bike_dates = agg_is_bike$train_month
+bike_values = agg_is_bike$sum_bikes
+ts_bike <- xts(x = bike_values, order.by = bike_dates)
+```
+
+##### 3.1.1. Autocorrelation, trend and stationarity
+
+Autocorrelation function:
+
+```{r bike autocorrelation function, echo=FALSE}
+acf(ts_bike)
+```
+
+Autocorrelation function shows a tapering pattern, this time series does not look stationary.
+
+I performed two tests, Ljung-Box test and Kwiatkowski-Phillips-Schmidt-Shin (KPSS) test to test for stationarity. 
+
+```{r bike count Ljung-Box test, echo=FALSE}
+Box.test(ts_bike, lag= 20, type="Ljung-Box")
+```
+```{r bike count KPSS test, echo=FALSE, warning=FALSE}
+kpss.test(ts_bike, null="Trend")
+```
+
+Time series of monthly bike rides can be described with high level of confidence as not stationary and with a trend, so I looked closer at seasonal patterns.
+
+```{r bike seasonal patterns, echo=FALSE}
+plot_stl_diagnostics(agg_is_bike, train_month, sum_bikes,
+  .frequency = "auto", .trend = "auto",
+  .feature_set = c("observed", "season", "trend", "remainder"),
+  .interactive = F)
+```
+
+A trend can be visualized in this time series.
+
+##### 3.1.2. Prediction of number of bike rides in the next 12 months
+
+In order to predict the number of bike rides, I first analysed which model performed best on the available dataset.
+
+```{r bike pick model, echo=FALSE, warning=FALSE}
+
+frequency = "month"
+
+list_model = getBestModel(bike_dates, bike_values, frequency)
+```
+
+The best performing algorithm was the STLM model, with the following predictions for 2022:
+
+```{r bike predictions, echo=FALSE, warning=FALSE}
+pred_ts_bike <- list_model %>%
+  my.predictions() %>%
+  mutate_at(4,function(xx)  ifelse(xx<0,0,xx))
+
+pred_ts_bike %>%
+  filter(type %in% c(NA,"mean")) %>%
+  ggplot() + geom_line(aes(dates,actual.value),color="orange") +
+  geom_line(aes(dates,stlm),linetype=2,color="orange") +
+  theme_minimal() +
+  labs(y="Number of bike rides")
+```
+
+##### 3.2. Monthly distance
+This time series shows monthly sum of distances in the last 10 years.
+```{r create time series of distance, include=FALSE}
+dist_dates = agg_distance$train_month
+dist_values = agg_distance$sum_distance
+ts_dist <- xts(x = dist_values, order.by = dist_dates)
+```
+
+##### 3.2.1. Autocorrelation, trend and stationarity
+
+Autocorrelation function:
+
+```{r distance autocorrelation function, echo=FALSE}
+acf(ts_dist)
+```
+
+This time series does not look stationary.
+Again, I performed Ljung-Box and KPSS tests to test for stationarity. 
+
+```{r distance Ljung-Box test, echo=FALSE}
+Box.test(ts_dist, lag= 20, type="Ljung-Box")
+```
+```{r distance KPSS test, echo=FALSE, warning=FALSE}
+kpss.test(ts_dist, null="Trend")
+```
+
+Time series of monthly distances can be described with some level of confidence as not stationary, although according to KPSS test we cannot confidently discard the hypothesis that the time series is stationary. Again, I looked closer at seasonal patterns.
+
+```{r distance seasonal patterns, echo=FALSE}
+plot_stl_diagnostics(agg_distance, train_month, sum_distance,
+                     .frequency = "auto", .trend = "auto",
+                     .feature_set = c("observed", "season", "trend", "remainder"),
+                     .interactive = F)
+```
+
+Both a trend and some seasonality can be visualized in this time series.
+
+#### 3.2.2. Prediction of monthly distances in the next 12 months
+
+In order to predict the monthly distances, I first analysed which model performed best on the available dataset.
+
+```{r distance pick model, echo=FALSE, warning=FALSE}
+
+frequency = "month"
+
+list_model2 = getBestModel(dist_dates, dist_values, frequency)
+```
+
+The best performing algorithm was the SARIMA model, with the following predictions for 2022:
+
+```{r distance predictions, echo=FALSE, warning=FALSE}
+pred_ts_dist <- list_model2 %>%
+  my.predictions() %>%
+  mutate_at(4,function(xx)  ifelse(xx<0,0,xx))
+
+pred_ts_dist %>%
+  filter(type %in% c(NA,"mean")) %>%
+  ggplot() + geom_line(aes(dates,actual.value),color="orange") +
+  geom_line(aes(dates,sarima),linetype=2,color="orange") +
+  theme_minimal() +
+  labs(y="Monthly distance")
+
+```
+
+##### 3.3. Monthly activity duration
+This time series shows monthly sum of activity duration in the last 10 years.
+```{r create time series of duration, include=FALSE}
+dur_dates = agg_duration$train_month
+dur_values = agg_duration$sum_duration
+ts_dur <- xts(x = dur_values, order.by = dur_dates)
+```
+
+##### 3.3.1. Autocorrelation, trend and stationarity
+
+Autocorrelation function:
+
+```{r duration autocorrelation function, echo=FALSE}
+acf(ts_dur)
+```
+
+This time series does not look stationary.
+Again, I performed Ljung-Box and KPSS tests to test for stationarity. 
+
+```{r duration Ljung-Box test, echo=FALSE}
+Box.test(ts_dur, lag= 20, type="Ljung-Box")
+```
+```{r duration KPSS test, echo=FALSE, warning=FALSE}
+kpss.test(ts_dur, null="Trend")
+```
+
+Time series of monthly distances can be described with high level of confidence as not stationary. Again, I looked closer at seasonal patterns.
+
+```{r duration seasonal patterns, echo=FALSE}
+plot_stl_diagnostics(agg_duration, train_month, sum_duration,
+                     .frequency = "auto", .trend = "auto",
+                     .feature_set = c("observed", "season", "trend", "remainder"),
+                     .interactive = F)
+```
+
+Both a trend and some seasonality can be visualized in this time series.
+
+##### 3.3.2. Prediction of monthly activity duration in the next 12 months
+
+In order to predict the monthly activity duration, I first analysed which model performed best on the available dataset.
+
+```{r duration pick model, echo=FALSE, warning=FALSE}
+
+frequency = "month"
+
+list_model3 = getBestModel(dur_dates, dur_values, frequency)
+```
+
+The best performing algorithm was the ETS model, with the following (surprising) predictions for 2022:
+
+```{r duration predictions, echo=FALSE, warning=FALSE}
+pred_ts_dur <- list_model3 %>%
+  my.predictions() %>%
+  mutate_at(4,function(xx)  ifelse(xx<0,0,xx))
+
+pred_ts_dur %>%
+  filter(type %in% c(NA,"mean")) %>%
+  ggplot() + geom_line(aes(dates,actual.value),color="orange") +
+  geom_line(aes(dates,ets),linetype=2,color="orange") +
+  theme_minimal() +
+  labs(y="Monthly duration")
+
+```
+
+I am not entirely sure how to interpret this result, it seems as if there was no trend and seasonality in the data, which is in contrast with the findings above. 
+
+##### 3.4. Monthly average biking speed
+This time series shows monthly average of average biking speed in the last 10 years.
+```{r create time series of speed, include=FALSE}
+speed_dates = agg_speed$train_month
+speed_values = agg_speed$mean_speed
+ts_speed <- xts(x = speed_values, order.by = speed_dates)
+```
+
+##### 3.4.1. Autocorrelation, trend and stationarity
+
+Autocorrelation function:
+
+```{r speed autocorrelation function, echo=FALSE}
+acf(ts_speed)
+```
+
+This time series does not look stationary.
+Again, I performed Ljung-Box and KPSS tests to test for stationarity. 
+
+```{r speed Ljung-Box test, echo=FALSE}
+Box.test(ts_speed, lag= 20, type="Ljung-Box")
+```
+```{r speed KPSS test, echo=FALSE, warning=FALSE}
+kpss.test(ts_speed, null="Trend")
+```
+
+Time series of monthly average biking speed can be described with high level of confidence as not stationary. Again, I looked closer at seasonal patterns.
+
+```{r speed seasonal patterns, echo=FALSE}
+plot_stl_diagnostics(agg_speed, train_month, mean_speed,
+                     .frequency = "auto", .trend = "auto",
+                     .feature_set = c("observed", "season", "trend", "remainder"),
+                     .interactive = F)
+```
+
+A trend can be visualized in this time series.
+
+##### 3.4.2. Prediction of monthly average biking speed in the next 12 months
+
+In order to predict the monthly average biking speed, I first analysed which model performed best on the available dataset.
+
+```{r speed pick model, echo=FALSE, warning=FALSE}
+
+frequency = "month"
+
+list_model4 = getBestModel(speed_dates, speed_values, frequency)
+```
+
+The best performing algorithm was the STLM model, with the following predictions for 2022:
+
+```{r speed predictions, echo=FALSE, warning=FALSE}
+pred_ts_speed <- list_model4 %>%
+  my.predictions() %>%
+  mutate_at(4,function(xx)  ifelse(xx<0,0,xx))
+
+pred_ts_speed %>%
+  filter(type %in% c(NA,"mean")) %>%
+  ggplot() + geom_line(aes(dates,actual.value),color="orange") +
+  geom_line(aes(dates,stlm),linetype=2,color="orange") +
+  theme_minimal() +
+  labs(y="Average speed")
+
+```
