@@ -5,4 +5,4 @@ For chosen activities a time series is constructed, and predictions are made for
 
 ## List of files and folders:
 
-1. **Finding numbers**: a script (1_finding_numbers.py) and data to run the script on (1_finding_numbers.txt, [source](http://py4e-data.dr-chuck.net/)). The script reads through and parses a file with text and numbers, extracts all the numbers in the file, and computes their sum. 
+1. **Time series: Sport activities**: a script (sport_activities_time_series.Rmd) reads through and parses a json file, and analyses records of sport activities. It selects a number of metrics of the activities, and creates and analyses monthly time series out of it. It also attempts to predict each time series 12 months ahead.
